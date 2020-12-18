@@ -1,11 +1,15 @@
 apiVersion: v1
 baseDomain: $BASE_DOMAIN
 compute:
-- architecture: amd64
-  hyperthreading: Enabled
-  name: worker
-  platform: {}
-  replicas: 3
+  - architecture: amd64
+    hyperthreading: Enabled
+    name: worker
+    platform:
+      azure:
+        type: Standard_D4s_v3
+        osDisk:
+          diskSizeGB: 512
+    replicas: 3
 controlPlane:
   architecture: amd64
   hyperthreading: Enabled
@@ -17,13 +21,13 @@ metadata:
   name: $CLUSTER_NAME
 networking:
   clusterNetwork:
-  - cidr: 10.128.0.0/14
-    hostPrefix: 23
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
   machineNetwork:
-  - cidr: 10.4.0.0/14
+    - cidr: 10.4.0.0/14
   networkType: OpenShiftSDN
   serviceNetwork:
-  - 172.30.0.0/16
+    - 172.30.0.0/16
 platform:
   azure:
     region: $AZURE_REGION

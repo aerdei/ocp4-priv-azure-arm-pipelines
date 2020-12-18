@@ -1,0 +1,14 @@
+{
+    "apiVersion": "machine.openshift.io/v1beta1",
+    "kind": "MachineSet",
+    "metadata": { 
+        "labels": {
+            "machine.openshift.io/cluster-api-cluster": "",
+            "machine.openshift.io/cluster-api-machine-role": "infra",
+            "machine.openshift.io/cluster-api-machine-type": "infra"
+        },
+        "name": "",
+        "namespace": "openshift-machine-api"
+    },
+    "spec": {}
+}

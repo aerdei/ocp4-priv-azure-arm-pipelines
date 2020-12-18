@@ -1,0 +1,27 @@
+variables:
+  - name: azureRegion
+    value: "northeurope"
+
+  - name: networkResourceGroup
+    value: "networking-rg"
+
+  - name: openShiftResourceGroup
+    value: "openshift-1-rg"
+
+  - name: ocpVersion
+    value: "4.6"
+
+  - name: clusterName
+    value: "devtest"
+
+  - name: baseDomain
+    value: "ocp.testing"
+
+  - name: networkName
+    value: "ocp-4-vnet"
+
+  - name: controlPlaneSubnet
+    value: "ocp-4-controlplane-subnet"
+
+  - name: computeSubnet
+    value: "ocp-4-compute-subnet"

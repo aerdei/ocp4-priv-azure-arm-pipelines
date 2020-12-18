@@ -12,3 +12,4 @@ kube*
 *.vhd
 *.zip
 azure-gw
+id_rsa*

@@ -155,6 +155,20 @@
   },
   "resources": [
     {
+      "name": "[concat(parameters('baseName'),'-availability-set')]",
+      "type": "Microsoft.Compute/availabilitySets",
+      "apiVersion": "2020-06-01",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('resourceTags')]",
+      "properties": {
+        "platformUpdateDomainCount": 3,
+        "platformFaultDomainCount": 2
+      },
+      "sku": {
+        "name": "Aligned"
+      }
+    },
+    {
       "apiVersion": "2020-06-01",
       "type": "Microsoft.Network/networkInterfaces",
       "copy": {
@@ -244,7 +258,8 @@
       "dependsOn": [
         "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('vmNames')[copyIndex()], '-nic'))]",
         "[resourceId('Microsoft.Network/privateDnsZones/A', parameters('privateDNSZoneName'), concat('etcd-', copyIndex()))]",
-        "[resourceId('Microsoft.Network/privateDnsZones/SRV', parameters('privateDNSZoneName'), '_etcd-server-ssl._tcp')]"
+        "[resourceId('Microsoft.Network/privateDnsZones/SRV', parameters('privateDNSZoneName'), '_etcd-server-ssl._tcp')]",
+        "[resourceId('Microsoft.Compute/availabilitySets', concat(parameters('baseName'),'-availability-set'))]"
       ],
       "properties": {
         "hardwareProfile": {
@@ -291,6 +306,9 @@
               }
             }
           ]
+        },
+        "availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets', concat(parameters('baseName'),'-availability-set'))]"
         }
       }
     }

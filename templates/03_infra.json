@@ -81,24 +81,7 @@
       "name": "[variables('clusterNsgName')]",
       "tags": "[parameters('resourceTags')]",
       "apiVersion": "2020-06-01",
-      "location": "[parameters('location')]",
-      "properties": {
-        "securityRules": [
-          {
-            "name": "apiserver_in",
-            "properties": {
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "6443",
-              "sourceAddressPrefix": "*",
-              "destinationAddressPrefix": "*",
-              "access": "Allow",
-              "priority": 101,
-              "direction": "Inbound"
-            }
-          }
-        ]
-      }
+      "location": "[parameters('location')]"
     },
     {
       "apiVersion": "2018-12-01",

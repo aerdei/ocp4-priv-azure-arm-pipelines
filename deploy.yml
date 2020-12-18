@@ -1,0 +1,265 @@
+name: ocp4-deploy
+
+trigger:
+  - master
+
+pool:
+  name: "ocp-4-agents"
+
+variables:
+  - group: ocp-4-variable-group
+  - template: variables.yml
+
+stages:
+  - stage: deploy_cluster
+    jobs:
+      - job: deploy_openshift
+        steps:
+          - task: AzureCLI@2
+            displayName: Make sure OpenShift resource group is empty
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                $(az resource list -g ${{ variables.openShiftResourceGroup }} | jq '. == []')
+              failOnStandardError: true
+
+          - task: Bash@3
+            displayName: Acquire OpenShift installer
+            inputs:
+              targetType: "inline"
+              script: "curl --location --fail --silent --show-error https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-${{ variables.ocpVersion }}/openshift-install-linux.tar.gz | tar -xz openshift-install"
+              failOnStderr: true
+
+          - task: Bash@3
+            displayName: Prepare OpenShift install config file
+            inputs:
+              targetType: "inline"
+              script: |
+                mkdir ${{ variables.clusterName }}
+                envsubst < ./installer/install-config.bk.yaml > ./${{ variables.clusterName }}/install-config.yaml
+                cat ./${{ variables.clusterName }}/install-config.yaml
+              failOnStderr: true
+            env:
+              BASE_DOMAIN: "${{ variables.baseDomain }}"
+              CLUSTER_NAME: "${{ variables.clusterName }}"
+              AZURE_REGION: "${{ variables.azureRegion }}"
+              OCP_RG: "${{ variables.openShiftResourceGroup }}"
+              VNET_RG: "${{ variables.networkResourceGroup }}"
+              VNET_NAME: "${{ variables.networkName }}"
+              CONTROL_PLANE_SUBNET: "${{ variables.controlPlaneSubnet }}"
+              COMPUTE_SUBNET: "${{ variables.computeSubnet }}"
+              PULL_SECRET: $(ocp-4-pullsecret)
+              SSH_KEY: $(ocp-4-ssh-pub)
+
+          - task: AzureCLI@2
+            displayName: Get subscriptionId
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                subscriptionId=`az account show | jq -r -c .id`
+                echo "##vso[task.setvariable variable=subscriptionId;]$subscriptionId"
+              failOnStandardError: true
+
+          - task: Bash@3
+            displayName: Prepare osServicePrincipal.json
+            inputs:
+              targetType: "inline"
+              script: |
+                jq --arg key0 'subscriptionId' \
+                --arg value0 '$(subscriptionId)' \
+                --arg key1 'clientId'   \
+                --arg value1 '$(ocp-4-sp-id)' \
+                --arg key2 'clientSecret'  \
+                --arg value2 '$(ocp-4-sp-pw)' \
+                --arg key3 'tenantId' \
+                --arg value3 '$(ocp-4-sp-tid)' \
+                '. | .[$key0]=$value0 | .[$key1]=$value1 | .[$key2]=$value2 | .[$key3]=$value3' <<< {} | tee osServicePrincipal.json
+              failOnStderr: true
+
+          - task: Bash@3
+            displayName: Prepare OpenShift manifest files
+            inputs:
+              targetType: "inline"
+              script: |
+                ./openshift-install create manifests --dir=./${{ variables.clusterName }} --log-level error
+                rm -f ./${{ variables.clusterName }}/openshift/99_openshift-cluster-api_master-machines-*.yaml
+                sed -i 's/mastersSchedulable: true/mastersSchedulable: false/g' ./${{ variables.clusterName }}/manifests/cluster-scheduler-02-config.yml
+              failOnStderr: true
+            env:
+              AZURE_AUTH_LOCATION: ./osServicePrincipal.json
+
+          - task: PythonScript@0
+            displayName: Add labels to compute machineSet
+            inputs:
+              scriptSource: inline
+              script: |
+                #!/usr/bin/env python3
+                """This script updates the compute machineset manifests with tags
+                found in templates/tags.parameters.json and templates/computetags.json"""
+                import glob
+                import json
+                import yaml
+                    
+                for i in glob.glob(
+                    "./${{ variables.clusterName }}/openshift/99_openshift-cluster-api_worker-machineset-*.yaml"
+                ):
+                    with open(i, "r") as f, open("./templates/tags.parameters.json") as p, open(
+                        "./templates/computetags.json"
+                    ) as t:
+                        tagsparams = json.load(p)
+                        computetags = json.load(t)
+                        manifest = yaml.safe_load(f)
+                        manifest["spec"]["template"]["spec"]["providerSpec"]["value"][
+                            "tags"
+                        ] = tagsparams["parameters"]["resourceTags"]["value"]
+                        manifest["spec"]["template"]["spec"]["providerSpec"]["value"]["tags"].update(
+                            computetags
+                        )
+                    with open(i, "w") as f:
+                        yaml.dump(manifest, f)
+
+              pythonInterpreter: /usr/bin/python3
+              failOnStderr: true
+
+          - task: Bash@3
+            displayName: Get infraId variable
+            inputs:
+              targetType: "inline"
+              script: |
+                infraId=`grep -oP "(?<=infrastructureName: ).*" ./${{ variables.clusterName }}/manifests/cluster-infrastructure-02-config.yml`
+                echo "##vso[task.setvariable variable=infraId;]$infraId"
+              failOnStderr: true
+
+          - task: Bash@3
+            displayName: Create ignition configs
+            inputs:
+              targetType: "inline"
+              script: "./openshift-install create ignition-configs  --dir=./${{ variables.clusterName }} --log-level error"
+              failOnStderr: true
+
+          - task: AzureCLI@2
+            displayName: Export credentials to Key Vault
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az keyvault secret set -n "$(infraId)-kubeconfig" --vault-name ocp-4-kv --file ./${{ variables.clusterName }}/auth/kubeconfig --output none
+                az keyvault secret set -n "$(infraId)-kubeadmin-password" --vault-name ocp-4-kv --file ./${{ variables.clusterName }}/auth/kubeadmin-password --output none
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Deploy identity
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az deployment group create --template-file "./templates/01_identity.json" --parameters baseName='$(infraId)' --parameters networkResourceGroup="${{ variables.networkResourceGroup }}" -g "${{ variables.openShiftResourceGroup }}" --parameters @./templates/tags.parameters.json
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Deploy storage
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az deployment group create -g "${{ variables.openShiftResourceGroup }}" --template-file "./templates/02_storage.json" --parameters baseName='$(infraId)' --parameters @./templates/tags.parameters.json
+                storageAccountName=`az deployment group show -g "${{ variables.openShiftResourceGroup }}" -n 02_storage --query properties.outputs.storageAccountName.value -o tsv`
+                storageAccountKey=`az storage account keys list -g ${{ variables.openShiftResourceGroup }} --account-name $storageAccountName --query "[0].value" -o tsv`
+                echo "##vso[task.setvariable variable=storageAccountName;]$storageAccountName"
+                echo "##vso[task.setvariable variable=storageAccountKey;]$storageAccountKey"
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Copy VHD to blob container
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                vhdUrl=$(curl -s https://raw.githubusercontent.com/openshift/installer/release-${{ variables.ocpVersion }}/data/data/rhcos.json | jq -c -r .azure.url)
+                az storage blob copy start --account-name '$(storageAccountName)' --account-key '$(storageAccountKey)' --destination-blob "rhcos.vhd" --destination-container vhd --source-uri $vhdUrl
+                echo "`date -Iseconds`: started blob copy."
+                status="unknown"
+                while [ "$status" != "success" ]
+                do
+                  sleep 60s
+                  status=`az storage blob show --account-name '$(storageAccountName)' --account-key '$(storageAccountKey)' --container-name vhd --name "rhcos.vhd" -o tsv --query properties.copy.status`
+                  echo "`date -Iseconds`: progress is $status."
+                done
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Upload bootstrap ignition config
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az storage blob upload --account-name '$(storageAccountName)' --account-key '$(storageAccountKey)' -c "files" -f "./${{ variables.clusterName }}/bootstrap.ign" -n "bootstrap.ign"
+
+          - task: AzureCLI@2
+            displayName: Deploy infrastructure components
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                vhdBlobUrl=`az storage blob url --account-name '$(storageAccountName)' --account-key '$(storageAccountKey)' -c vhd -n "rhcos.vhd" -o tsv`
+                az deployment group create -g "${{ variables.openShiftResourceGroup }}" --template-file "./templates/03_infra.json" --parameters privateDNSZoneName="${{ variables.clusterName }}.${{ variables.baseDomain }}" --parameters baseName='$(infraId)' --parameters networkResourceGroupName="${{ variables.networkResourceGroup }}" --parameters virtualNetworkName="${{ variables.networkName }}" --parameters vhdBlobURL="$vhdBlobUrl" --parameters controlPlaneSubnetName="${{ variables.controlPlaneSubnet }}" --parameters @./templates/tags.parameters.json
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Deploy bootstrap components
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                bootstrapUrl=`az storage blob url --account-name '$(storageAccountName)' --account-key '$(storageAccountKey)' -c "files" -n "bootstrap.ign" -o tsv`
+                bootstrapIgnition=`jq -rcnM --arg v "3.1.0" --arg url "$bootstrapUrl" '{ignition:{version:$v,config:{replace:{source:$url}}}}' | base64 -w0`
+                az deployment group create -g "${{ variables.openShiftResourceGroup }}" --template-file "./templates/04_bootstrap.json" --parameters bootstrapIgnition="$bootstrapIgnition" --parameters sshKeyData="$(ocp-4-ssh-pub)" --parameters baseName='$(infraId)' --parameters networkResourceGroupName="${{ variables.networkResourceGroup }}" --parameters virtualNetworkName="${{ variables.networkName }}" --parameters controlPlaneSubnetName="${{ variables.controlPlaneSubnet }}" --parameters @./templates/tags.parameters.json
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Deploy control plane components
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                controlPlaneIgnition=$(base64 -w0 < ./${{ variables.clusterName }}/master.ign)
+                az deployment group create -g "${{ variables.openShiftResourceGroup }}" --template-file "./templates/05_control_plane.json" --parameters controlPlaneIgnition="$controlPlaneIgnition" --parameters sshKeyData='$(ocp-4-ssh-pub)' --parameters privateDNSZoneName="${{ variables.clusterName }}.${{ variables.baseDomain }}" --parameters baseName='$(infraId)' --parameters networkResourceGroupName="${{ variables.networkResourceGroup }}" --parameters virtualNetworkName="${{ variables.networkName }}" --parameters controlPlaneSubnetName="${{ variables.controlPlaneSubnet }}" --parameters @./templates/tags.parameters.json
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Wait for bootstrap-complete and remove bootstrap resources
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                ./openshift-install wait-for bootstrap-complete  --dir=./${{ variables.clusterName }} --log-level error
+                az vm stop -g "${{ variables.openShiftResourceGroup }}" --name "$(infraId)-bootstrap" --only-show-errors
+                az vm deallocate -g "${{ variables.openShiftResourceGroup }}" --name "$(infraId)-bootstrap" --only-show-errors
+                az vm delete -g "${{ variables.openShiftResourceGroup }}" --name "$(infraId)-bootstrap" --yes --only-show-errors
+                az disk delete -g "${{ variables.openShiftResourceGroup }}" --name "$(infraId)-bootstrap_OSDisk" --no-wait --yes --only-show-errors
+                az network nic delete -g "${{ variables.openShiftResourceGroup }}" --name "$(infraId)-bootstrap-nic" --no-wait --only-show-errors
+                az storage blob delete --account-key '$(storageAccountKey)' --account-name '$(storageAccountName)' --container-name files --name bootstrap.ign --only-show-errors
+              failOnStandardError: true
+
+          - task: AzureCLI@2
+            displayName: Wait for installation to complete
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                ./openshift-install wait-for install-complete  --dir=./${{ variables.clusterName }} --log-level error
+              failOnStandardError: true

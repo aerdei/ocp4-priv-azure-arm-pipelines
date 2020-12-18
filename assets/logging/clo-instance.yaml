@@ -1,0 +1,82 @@
+apiVersion: "logging.openshift.io/v1"
+kind: "ClusterLogging"
+metadata:
+  name: "instance" 
+  namespace: "openshift-logging" 
+spec:
+  managementState: "Managed" 
+  logStore:
+    type: "elasticsearch" 
+    retentionPolicy:
+      application:
+        maxAge: 1d
+      infra:
+        maxAge: 7d
+      audit:
+        maxAge: 7d
+    elasticsearch:
+      tolerations: 
+      - key: "node-role.kubernetes.io/infra"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeCount: 3
+      nodeSelector: 
+          node-role.kubernetes.io/infra: ''
+      resources:
+        limits:
+          memory: 16Gi
+        requests:
+          cpu: 1
+          memory: 16Gi
+      storage:
+        storageClassName: "managed-premium"
+        size: "512G"
+      redundancyPolicy: "SingleRedundancy"
+  visualization: 
+    type: "kibana"
+    kibana:
+      tolerations: 
+      - key: "node-role.kubernetes.io/infra"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector: 
+          node-role.kubernetes.io/infra: ''
+      resources:
+        limits:
+          memory: 4Gi
+        requests:
+          cpu: 500m
+          memory: 2Gi
+      replicas: 3
+  curation: 
+    type: "curator"
+    curator:
+      tolerations: 
+      - key: "node-role.kubernetes.io/infra"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector: 
+          node-role.kubernetes.io/infra: ''
+      resources:
+        limits:
+          memory: 2Gi
+        requests:
+          cpu: 500m
+          memory: 512Mi
+      schedule: "30 3 * * *"
+  collection: 
+    logs:
+      type: "fluentd"
+      fluentd:
+        tolerations: 
+        - key: "node-role.kubernetes.io/infra"
+          operator: "Exists"
+          effect: "NoSchedule"
+        nodeSelector: 
+          node-role.kubernetes.io/infra: ''
+        resources:
+          limits:
+            memory: 2Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi

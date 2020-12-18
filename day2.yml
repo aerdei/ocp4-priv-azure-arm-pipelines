@@ -1,0 +1,151 @@
+name: ocp4-day2
+
+trigger:
+  branches:
+    exclude:
+      - "*"
+
+pool:
+  name: "ocp-4-agents"
+
+variables:
+  - group: ocp-4-variable-group
+  - template: variables.yml
+
+resources:
+  pipelines:
+    - pipeline: ocp4-deploy # Name of the pipeline resource
+      source: ocp4-deploy # Name of the pipeline referenced by the pipeline resource
+      trigger:
+        branches:
+          include:
+            - refs/heads/master
+
+stages:
+  - stage: configure_day2
+    jobs:
+      - job: acquire_kubeconfig
+        steps:
+          - task: AzureCLI@2
+            displayName: Acquire kubeconfig for the cluster running in openShiftResourceGroup
+            inputs:
+              azureSubscription: "ocp-4-sa-azdo"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az keyvault secret download -n  "$(az resource list -g ${{ variables.openShiftResourceGroup }} --resource-type 'Microsoft.Compute/images' --query [].name | jq -r -c .[0])-kubeconfig" --vault-name ocp-4-kv --file ./kubeconfig
+
+              failOnStandardError: true
+
+          - publish: ./kubeconfig
+            artifact: ${{ variables.clusterName }}
+
+      - job: azure_aad_integration
+        dependsOn: acquire_kubeconfig
+        steps:
+          - download: current
+            artifact: ${{ variables.clusterName }}
+
+          - task: Bash@3
+            displayName: Azure AD authentication through openID
+            inputs:
+              targetType: "inline"
+              script: |
+                #!/bin/bash
+                set -e
+
+                oc get secret idp-secret -n openshift-config > /dev/null 2>&1 && oc delete secret idp-secret -n openshift-config
+                oc create secret generic idp-secret --from-literal=clientSecret=$(aad-client-secret) -n openshift-config
+                oc patch oauth cluster --type=merge  -p '{"spec":{"identityProviders":[{"mappingMethod":"claim","name":"AAD","openID":{"claims":{"email":["email"],"name":["name"],"preferredUsername":["upn"]},"clientID":"$(aad-client-id)","clientSecret":{"name":"idp-secret"},"issuer":"https://login.microsoftonline.com/$(aad-tenant-id)"},"type":"OpenID"}]}}'
+
+              failOnStderr: true
+            env:
+              KUBECONFIG: $(Pipeline.Workspace)/${{ variables.clusterName }}/kubeconfig
+
+      - job: deploy_infra_machineset
+        dependsOn: acquire_kubeconfig
+        steps:
+          - download: current
+            artifact: ${{ variables.clusterName }}
+
+          - task: Bash@3
+            displayName: Deploy infrastructure node machineSet
+            inputs:
+              targetType: "inline"
+              script: |
+                #!/bin/bash
+                set -e
+
+                oc get machineset -n openshift-machine-api -o name | grep "worker" | head -n 1 | xargs -i oc get {} -n openshift-machine-api -o json | jq  --arg m "$(oc get -o jsonpath='{.status.infrastructureName}' infrastructure cluster)" '.spec | .template.metadata.labels["machine.openshift.io/cluster-api-machine-role"] = "infra" | .template.metadata.labels["machine.openshift.io/cluster-api-machine-type"] = "infra" | .template.metadata.labels["machine.openshift.io/cluster-api-machineset"] =  $m+"-infra-"+.template.spec.providerSpec.value.location | .selector.matchLabels["machine.openshift.io/cluster-api-machineset"] = $m+"-infra-"+.template.spec.providerSpec.value.location | .template.spec.providerSpec.value.vmSize="Standard_D8s_v3" | .template.spec["taints"] = [{"effect":"NoSchedule","key":"node-role.kubernetes.io/infra"}] | {"spec": . }' > ./assets/infranode/infraspec.json
+                jq --arg i "$(oc get -o jsonpath='{.status.infrastructureName}' infrastructure cluster)" '.metadata.labels["machine.openshift.io/cluster-api-cluster"] = $i' < ./assets/infranode/machineset.template.json > ./assets/infranode/machineset.json                                             
+                jq -s '.[0] * .[1] | .metadata.name = .metadata.labels["machine.openshift.io/cluster-api-cluster"]+"-infra-"+.spec.template.spec.providerSpec.value.location | .spec.template.spec.metadata.labels = {"node-role.kubernetes.io/infra": ""}' ./assets/infranode/machineset.json ./assets/infranode/infraspec.json | oc apply -f -
+                while $(oc get machineset -o name -n openshift-machine-api | grep "infra" | head -n 1 | xargs -i oc get {} -n openshift-machine-api -o json | jq '.status.readyReplicas //= 0 | .spec.replicas-.status.readyReplicas != 0'); do echo "Waiting for infrastructure nodes to be ready. Sleeping for 60 seconds.";sleep 60; done
+
+              failOnStderr: true
+            env:
+              KUBECONFIG: $(Pipeline.Workspace)/${{ variables.clusterName }}/kubeconfig
+
+      - job: move_infra_components
+        dependsOn: deploy_infra_machineset
+        steps:
+          - download: current
+            artifact: ${{ variables.clusterName }}
+
+          - task: Bash@3
+            displayName: Move infrastructure workloads to infra nodes
+            inputs:
+              targetType: "inline"
+              script: |
+                #!/bin/bash
+                set -e
+
+                oc patch ingresscontroller default -n openshift-ingress-operator --type=merge  -p '{"spec":{"replicas":3,"nodePlacement":{"nodeSelector":{"matchLabels":{"node-role.kubernetes.io/infra":""}},"tolerations":[{"effect":"NoSchedule","key":"node-role.kubernetes.io/infra","operator":"Exists"}]}}}'
+                oc patch configs.imageregistry.operator.openshift.io cluster --type=merge  -p '{"spec":{"nodeSelector":{"node-role.kubernetes.io/infra": ""},"tolerations":[{"effect":"NoSchedule","key":"node-role.kubernetes.io/infra","operator":"Exists"}]}}'
+                oc apply -f ./assets/infranode/cluster-monitoring-configmap.yaml
+
+              failOnStderr: true
+            env:
+              KUBECONFIG: $(Pipeline.Workspace)/${{ variables.clusterName }}/kubeconfig
+
+      - job: deploy_logging
+        dependsOn: deploy_infra_machineset
+        steps:
+          - download: current
+            artifact: ${{ variables.clusterName }}
+
+          - task: Bash@3
+            displayName: Deploy cluster logging stack
+            inputs:
+              targetType: "inline"
+              script: |
+                #!/bin/bash
+                set -e
+
+                oc apply -f ./assets/logging/eo-namespace.yaml,./assets/logging/eo-og.yaml,./assets/logging/eo-sub.yaml,./assets/logging/clo-namespace.yaml,./assets/logging/clo-og.yaml,./assets/logging/clo-sub.yaml
+                while $(oc get csv -n openshift-logging -o name | grep clusterlogging | head -n 1 | xargs -i oc get -n openshift-logging {} -o json | jq -r -c '.status.phase //= "notReady" | .status.phase != "Succeeded"'); do echo "Waiting for the cluster logging operator to install. Sleeping for 10 seconds."; sleep 10; done
+                oc apply -f ./assets/logging/clo-instance.yaml
+
+              failOnStderr: true
+            env:
+              KUBECONFIG: $(Pipeline.Workspace)/${{ variables.clusterName }}/kubeconfig
+
+      - job: configure_default_networkpolicy
+        dependsOn: deploy_logging
+        steps:
+          - download: current
+            artifact: ${{ variables.clusterName }}
+
+          - task: Bash@3
+            displayName: Create a modified namespace template and add the default networkpolicy to only allow communitation within a namespace
+            inputs:
+              targetType: "inline"
+              script: |
+                #!/bin/bash
+                set -e
+
+                oc apply -f ./assets/namespace/template.yml -n openshift-config
+                oc patch --type=merge project.config.openshift.io/cluster -p '{"spec":{"projectRequestTemplate":{"name": "project-request"}}}'
+
+              failOnStderr: true
+            env:
+              KUBECONFIG: $(Pipeline.Workspace)/${{ variables.clusterName }}/kubeconfig
